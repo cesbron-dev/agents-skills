@@ -22,7 +22,9 @@ git clone (shallow)  →  chunk .md files by heading
          ↓
   SQLite FTS5 index  ←  mkdocs.yml nav (accurate URLs)
          ↓
-  BM25 search  →  top excerpts + source URLs  →  answer
+user query (any lang)  →  translate to docs_lang  →  BM25 search
+         ↓
+  top excerpts + source URLs  →  answer in user's language
 ```
 
 The index is rebuilt automatically when `git HEAD` changes. The git clone is refreshed
@@ -48,6 +50,7 @@ Create `.claude/mkdocs-docs.json` in the project root:
 | `base_url` | yes | — | Root URL of the published docs site |
 | `repo_name` | yes | — | Short slug → cache dir name |
 | `docs_path` | no | `docs` | Subdir inside the repo containing `.md` files |
+| `docs_lang` | no | `en` | Language of the documentation (`en`, `fr`, …) |
 | `update_interval_hours` | no | `24` | Hours between `git pull` checks |
 
 **Optional:** install `pyyaml` so the skill reads `mkdocs.yml` nav for exact page URLs.
@@ -63,7 +66,20 @@ pip install pyyaml
 Read `.claude/mkdocs-docs.json`. If it does not exist, tell the user and stop.
 Apply defaults for optional fields.
 
-### Step 2 — Search the index
+### Step 2 — Translate query to the docs language
+
+FTS5 is a keyword index: a French query will not match English documentation.
+Before calling the search script, translate the user's question into `docs_lang`.
+
+Rules:
+- Detect the user's query language from the conversation.
+- If it differs from `docs_lang`, silently translate the query yourself — do not tell the user.
+- Keep technical terms, identifiers, and code as-is (they are language-neutral).
+- Prefer a concise keyword-style rephrasing over a literal translation, e.g.
+  `"comment configurer l'authentification ?"` → `"configure authentication"`.
+- If the user's language matches `docs_lang`, use the query as-is.
+
+### Step 3 — Search the index
 
 Run the search script with the user's question:
 
@@ -84,7 +100,7 @@ The script handles everything automatically:
 - Parses `mkdocs.yml` nav to produce accurate URLs (requires `pyyaml`)
 - Returns BM25-ranked excerpts with `snippet()` highlighting
 
-### Step 3 — If no results, discover available pages
+### Step 4 — If no results, discover available pages
 
 ```bash
 python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py \
@@ -95,7 +111,7 @@ python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py \
 
 Use the page list to suggest where to look or rephrase the query.
 
-### Step 4 — Force index rebuild (when needed)
+### Step 5 — Force index rebuild (when needed)
 
 Add `--reindex` to force a full rebuild, e.g. after manually pulling new docs:
 
@@ -103,14 +119,15 @@ Add `--reindex` to force a full rebuild, e.g. after manually pulling new docs:
 python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py ... --reindex
 ```
 
-### Step 5 — Answer from excerpts only
+### Step 6 — Answer from excerpts only
 
 - Use **only** the returned excerpts; do not hallucinate missing content.
 - Quote the excerpt directly when relevant.
 - Synthesise across multiple pages if the question spans topics.
 - If the answer is not in the docs, say so and suggest the most related page.
+- **Always reply in the user's language**, regardless of the docs language.
 
-### Step 6 — Always append Sources
+### Step 7 — Always append Sources
 
 End every response with:
 
