@@ -1,19 +1,32 @@
 ---
 name: mkdocs-docs
 description: |
-  Search and query a MkDocs documentation site using a local git cache.
+  Search and query a MkDocs documentation site using a local git cache and SQLite FTS5 index.
   Use when: the user asks questions about a project that has MkDocs documentation;
   the user wants to find guides, API references, or configuration docs;
   the user types "how do I …" or "what is …" about a documented project.
-  Clones the docs repo once, checks for updates periodically, and returns only
-  relevant excerpts — not the full docs — to keep token usage low.
+  Clones the docs repo once, indexes content with BM25 (SQLite FTS5), checks for updates
+  periodically, and returns only relevant excerpts — not the full docs — to keep token usage low.
   Always ends responses with a Sources section linking to the online docs.
 ---
 
 # MkDocs Documentation Search
 
-Token-efficient documentation assistant. The local git clone is used as a RAG source:
-only the most relevant markdown excerpts are loaded into context, not the full site.
+Token-efficient documentation assistant using a local SQLite FTS5 index built from a git clone.
+Only BM25-ranked excerpts are loaded into context; full source URLs are always cited.
+
+## How it works
+
+```
+git clone (shallow)  →  chunk .md files by heading
+         ↓
+  SQLite FTS5 index  ←  mkdocs.yml nav (accurate URLs)
+         ↓
+  BM25 search  →  top excerpts + source URLs  →  answer
+```
+
+The index is rebuilt automatically when `git HEAD` changes. The git clone is refreshed
+on a configurable interval (default 24 h) using `fetch --depth=1 + reset --hard`.
 
 ## Prerequisites — project configuration
 
@@ -29,82 +42,91 @@ Create `.claude/mkdocs-docs.json` in the project root:
 }
 ```
 
-| Field | Required | Description |
-|---|---|---|
-| `repo_url` | yes | Git clone URL of the MkDocs repository |
-| `base_url` | yes | Root URL of the published documentation site |
-| `repo_name` | yes | Short slug used as the cache directory name |
-| `docs_path` | no | Subdirectory inside the repo that contains `.md` files (default: `docs`) |
-| `update_interval_hours` | no | How often to `git pull` the cache (default: `24`) |
+| Field | Required | Default | Description |
+|---|---|---|---|
+| `repo_url` | yes | — | Git clone URL of the MkDocs repo |
+| `base_url` | yes | — | Root URL of the published docs site |
+| `repo_name` | yes | — | Short slug → cache dir name |
+| `docs_path` | no | `docs` | Subdir inside the repo containing `.md` files |
+| `update_interval_hours` | no | `24` | Hours between `git pull` checks |
+
+**Optional:** install `pyyaml` so the skill reads `mkdocs.yml` nav for exact page URLs.
+Without it, URLs are derived from file paths (usually correct but may differ for custom nav).
+```bash
+pip install pyyaml
+```
 
 ## Workflow
 
 ### Step 1 — Load config
 
 Read `.claude/mkdocs-docs.json`. If it does not exist, tell the user and stop.
-Extract all fields, applying defaults for optional ones.
+Apply defaults for optional fields.
 
-### Step 2 — Search the local cache
+### Step 2 — Search the index
 
-Run the search script with the user's question as the query:
-
-```bash
-python3 "$(dirname "$0")/../bin/doc-search.py" \
-  --repo-url   "<repo_url>" \
-  --repo-name  "<repo_name>" \
-  --base-url   "<base_url>" \
-  --docs-path  "<docs_path>" \
-  --update-interval <update_interval_hours> \
-  --query      "<user question or key terms>" \
-  --max-results 5
-```
-
-The script will:
-- Clone the repo on first run (`~/.cache/agents-skills/docs/<repo_name>/`)
-- Automatically pull if the cache is older than `update_interval_hours`
-- Score every `.md` file by term frequency and extract the top matching sections
-- Print excerpts with source URLs
-
-### Step 3 — If no results, list sections
-
-If the search returns "No relevant documentation found", run with `--list-sections`
-to discover what topics the docs cover:
+Run the search script with the user's question:
 
 ```bash
-python3 "$(dirname "$0")/../bin/doc-search.py" \
-  --repo-url  "<repo_url>" \
-  --repo-name "<repo_name>" \
-  --base-url  "<base_url>" \
-  --docs-path "<docs_path>" \
-  --list-sections
+python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py \
+  --repo-url          "<repo_url>" \
+  --repo-name         "<repo_name>" \
+  --base-url          "<base_url>" \
+  --docs-path         "<docs_path>" \
+  --update-interval   <update_interval_hours> \
+  --query             "<user question or key terms>" \
+  --max-results       5
 ```
 
-Then re-run the search with adjusted keywords, or tell the user which sections exist.
+The script handles everything automatically:
+- Clones the repo if `~/.cache/agents-skills/docs/<repo_name>/` is missing
+- Pulls and rebuilds the SQLite index when `git HEAD` changes
+- Parses `mkdocs.yml` nav to produce accurate URLs (requires `pyyaml`)
+- Returns BM25-ranked excerpts with `snippet()` highlighting
 
-### Step 4 — Answer from excerpts only
+### Step 3 — If no results, discover available pages
 
-- Use **only** the returned excerpts to answer; do not guess or hallucinate.
-- Keep the answer concise — quote the relevant part of the excerpt.
-- If the question spans multiple pages, synthesise across sources.
-- If the answer is genuinely not in the docs, say so explicitly.
+```bash
+python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py \
+  --repo-url  "<repo_url>"  --repo-name "<repo_name>" \
+  --base-url  "<base_url>"  --docs-path "<docs_path>" \
+  --list-pages
+```
 
-### Step 5 — Always append a Sources section
+Use the page list to suggest where to look or rephrase the query.
+
+### Step 4 — Force index rebuild (when needed)
+
+Add `--reindex` to force a full rebuild, e.g. after manually pulling new docs:
+
+```bash
+python3 ~/.claude/skills/mkdocs-docs/bin/doc-search.py ... --reindex
+```
+
+### Step 5 — Answer from excerpts only
+
+- Use **only** the returned excerpts; do not hallucinate missing content.
+- Quote the excerpt directly when relevant.
+- Synthesise across multiple pages if the question spans topics.
+- If the answer is not in the docs, say so and suggest the most related page.
+
+### Step 6 — Always append Sources
 
 End every response with:
 
 ```
 **Sources**
-- [Page title](https://docs.example.com/section/page/) — one-line summary of what this page covers
+- [Page title](https://docs.example.com/section/page/) — what this page covers
 ```
 
-List every page referenced, even if only partially used.
-
-## Cache details
+## Index details
 
 | Item | Value |
 |---|---|
-| Cache root | `~/.cache/agents-skills/docs/` |
-| Clone flags | `--depth=1` (shallow, saves disk) |
-| Update method | `git fetch --depth=1` + `git reset --hard origin/HEAD` |
-| Offline behaviour | Silently continues with existing cache; prints a warning to stderr |
-| URL mismatch | Re-clones if `repo_url` differs from the cached remote |
+| Index location | `~/.cache/agents-skills/docs/<repo_name>/.search.db` |
+| FTS engine | SQLite FTS5, BM25 ranking, unicode61 tokenizer |
+| Chunk size | ≤ 350 words per section |
+| Snippet | `snippet()` with `<b>` highlighting, ~60 tokens |
+| Invalidation | Triggered by `git HEAD` change or `--reindex` flag |
+| Clone mode | `--depth=1` shallow clone |
+| Offline | Continues with existing cache; prints warning to stderr |

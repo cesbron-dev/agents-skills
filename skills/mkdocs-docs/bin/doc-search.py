@@ -2,13 +2,15 @@
 """
 MkDocs local RAG search — agents-skills.
 
-Clones a MkDocs documentation repo to a local cache, keeps it updated,
-and returns relevant excerpts to minimise token usage in agent contexts.
+SQLite FTS5 (BM25) index + mkdocs.yml nav + shallow git cache.
+No external dependencies beyond pyyaml (optional, enables nav-based URLs).
 """
 
 import argparse
 import json
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -16,186 +18,335 @@ from pathlib import Path
 
 CACHE_BASE = Path.home() / ".cache" / "agents-skills" / "docs"
 
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None
 
 # ---------------------------------------------------------------------------
 # Cache management
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
-def _remote_url(cache_dir: Path) -> str | None:
-    r = _run(["git", "-C", str(cache_dir), "remote", "get-url", "origin"])
+def _git_head(d: Path) -> str | None:
+    r = _run(["git", "-C", str(d), "rev-parse", "HEAD"])
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def _needs_update(cache_dir: Path, interval_hours: int) -> bool:
-    marker = cache_dir / ".last-update"
-    if not marker.exists():
+def _remote_url(d: Path) -> str | None:
+    r = _run(["git", "-C", str(d), "remote", "get-url", "origin"])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _stale(d: Path, hours: int) -> bool:
+    m = d / ".last-update"
+    if not m.exists():
         return True
-    age = datetime.now() - datetime.fromtimestamp(marker.stat().st_mtime)
-    return age > timedelta(hours=interval_hours)
+    return datetime.now() - datetime.fromtimestamp(m.stat().st_mtime) > timedelta(hours=hours)
 
 
-def ensure_cache(repo_url: str, cache_dir: Path, interval_hours: int) -> None:
-    """Clone if missing, pull if stale. Silently continues when offline."""
+def ensure_cache(repo_url: str, cache_dir: Path, interval_h: int) -> bool:
+    """Clone if missing, pull if stale. Returns True when HEAD changed."""
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    git_dir = cache_dir / ".git"
-
-    # Re-clone if the cached remote URL no longer matches
-    if git_dir.exists() and _remote_url(cache_dir) != repo_url:
-        print(
-            f"[mkdocs-docs] Remote URL changed — re-cloning into {cache_dir}",
-            file=sys.stderr,
-        )
-        import shutil
+    if (cache_dir / ".git").exists() and _remote_url(cache_dir) != repo_url:
+        print("[mkdocs-docs] Remote URL changed — re-cloning", file=sys.stderr)
         shutil.rmtree(cache_dir)
         cache_dir.mkdir(parents=True)
-        git_dir = cache_dir / ".git"  # reset
 
-    if not git_dir.exists():
-        print(f"[mkdocs-docs] Cloning {repo_url} ...", file=sys.stderr)
+    head_before = _git_head(cache_dir)
+
+    if not (cache_dir / ".git").exists():
+        print(f"[mkdocs-docs] Cloning {repo_url} …", file=sys.stderr)
         r = _run(["git", "clone", "--depth=1", "--quiet", repo_url, str(cache_dir)])
         if r.returncode != 0:
             print(f"[mkdocs-docs] Clone failed: {r.stderr.strip()}", file=sys.stderr)
-            return
+            return False
         (cache_dir / ".last-update").touch()
-        return
+        return True
 
-    if _needs_update(cache_dir, interval_hours):
-        print("[mkdocs-docs] Refreshing docs cache ...", file=sys.stderr)
-        # fetch + hard reset is more reliable than pull on shallow clones
+    if _stale(cache_dir, interval_h):
+        print("[mkdocs-docs] Refreshing cache …", file=sys.stderr)
         r1 = _run(["git", "-C", str(cache_dir), "fetch", "--depth=1", "--quiet", "origin"])
         r2 = _run(["git", "-C", str(cache_dir), "reset", "--hard", "origin/HEAD"])
         if r1.returncode == 0 and r2.returncode == 0:
             (cache_dir / ".last-update").touch()
         else:
-            print(
-                "[mkdocs-docs] Could not update (offline?). Using cached version.",
-                file=sys.stderr,
-            )
+            print("[mkdocs-docs] Update failed (offline?). Using cached version.", file=sys.stderr)
+
+    return _git_head(cache_dir) != head_before
 
 
 # ---------------------------------------------------------------------------
-# Search / extraction
+# mkdocs.yml — nav → URL map
 # ---------------------------------------------------------------------------
 
-_HEADING_RE = re.compile(r"^#{1,4}\s+.+")
+
+def _file_to_url(file_path: str, base_url: str) -> str:
+    parts = Path(file_path).parts
+    url_parts = list(parts[:-1]) + ([] if parts[-1] == "index.md" else [parts[-1][:-3]])
+    slug = "/".join(url_parts)
+    return f"{base_url.rstrip('/')}/{slug}/" if slug else f"{base_url.rstrip('/')}/"
 
 
-def _extract_sections(content: str, terms: list[str], max_lines: int = 25) -> list[str]:
+def _walk_nav(nav, base_url: str, out: dict) -> None:
+    """Recursively walk a mkdocs nav list and populate out[rel_path] = url."""
+    for item in nav:
+        if isinstance(item, str):
+            out[item] = _file_to_url(item, base_url)
+        elif isinstance(item, dict):
+            for _title, value in item.items():
+                if isinstance(value, str):
+                    out[value] = _file_to_url(value, base_url)
+                elif isinstance(value, list):
+                    _walk_nav(value, base_url, out)
+
+
+def parse_nav(cache_dir: Path, base_url: str) -> dict[str, str]:
+    """Return {relative_md_path: url}. Empty dict if no yaml / no nav."""
+    if _yaml is None:
+        return {}
+    for name in ("mkdocs.yml", "mkdocs.yaml"):
+        p = cache_dir / name
+        if p.exists():
+            try:
+                cfg = _yaml.safe_load(p.read_text(errors="ignore"))
+                nav = cfg.get("nav") if isinstance(cfg, dict) else None
+                if nav:
+                    result: dict[str, str] = {}
+                    _walk_nav(nav, base_url, result)
+                    return result
+            except Exception as e:
+                print(f"[mkdocs-docs] mkdocs.yml parse error: {e}", file=sys.stderr)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Markdown → chunks
+# ---------------------------------------------------------------------------
+
+_HEADING = re.compile(r"^(#{1,4})\s+(.+)")
+_FRONT_MATTER = re.compile(r"^---\s*\n.*?\n---\s*\n", re.DOTALL)
+
+
+def _strip_frontmatter(text: str) -> str:
+    return _FRONT_MATTER.sub("", text, count=1)
+
+
+def chunk_markdown(content: str, max_words: int = 350) -> list[tuple[str, str]]:
     """
-    Split content at markdown headings and return the top-scored sections
-    that contain at least one query term.
+    Split content at headings into (section_title, body) pairs.
+    Large sections are further split by word count to cap token use.
     """
-    lines = content.splitlines()
+    text = _strip_frontmatter(content)
+    lines = text.splitlines()
 
-    # Collect section boundaries (line indices where headings appear)
-    boundaries = [i for i, ln in enumerate(lines) if _HEADING_RE.match(ln)]
-    boundaries.append(len(lines))
-    if not boundaries or boundaries[0] != 0:
-        boundaries.insert(0, 0)
+    sections: list[tuple[str, list[str]]] = []
+    cur_title = ""
+    cur_lines: list[str] = []
 
-    scored: list[tuple[int, str]] = []
-    for i in range(len(boundaries) - 1):
-        start, end = boundaries[i], boundaries[i + 1]
-        block_lines = lines[start:end]
-        block = "\n".join(block_lines)
-        block_lower = block.lower()
-        score = sum(block_lower.count(t) for t in terms)
-        if score > 0:
-            excerpt = "\n".join(block_lines[:max_lines])
-            if len(block_lines) > max_lines:
-                excerpt += "\n…"
-            scored.append((score, excerpt))
+    for line in lines:
+        m = _HEADING.match(line)
+        if m:
+            if cur_lines:
+                sections.append((cur_title, cur_lines))
+            cur_title = m.group(2).strip()
+            cur_lines = [line]
+        else:
+            cur_lines.append(line)
+    if cur_lines:
+        sections.append((cur_title, cur_lines))
 
-    scored.sort(reverse=True)
-    return [text for _, text in scored[:3]]
+    result: list[tuple[str, str]] = []
+    for title, sec_lines in sections:
+        body = "\n".join(sec_lines).strip()
+        if not body:
+            continue
+        words = body.split()
+        if len(words) <= max_words:
+            result.append((title, body))
+        else:
+            for i in range(0, len(words), max_words):
+                result.append((title, " ".join(words[i : i + max_words])))
+    return result
 
 
-def _path_to_url(rel: Path, base_url: str) -> str:
-    """Convert a docs-relative path to a published URL."""
-    parts = list(rel.parts)
-    if parts[-1] == "index.md":
-        url_parts = parts[:-1]
-    else:
-        url_parts = parts[:-1] + [parts[-1][:-3]]  # strip .md
-    url_path = "/".join(url_parts)
-    base = base_url.rstrip("/")
-    return f"{base}/{url_path}/" if url_path else f"{base}/"
+def page_title(content: str, fallback: str) -> str:
+    for ln in content.splitlines()[:20]:
+        if ln.startswith("# "):
+            return ln[2:].strip()
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# SQLite FTS5 index
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+    path   UNINDEXED,
+    title,
+    section,
+    url    UNINDEXED,
+    body,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+"""
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def _meta_get(conn: sqlite3.Connection, key: str) -> str | None:
+    r = conn.execute("SELECT value FROM _meta WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else None
+
+
+def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute("INSERT OR REPLACE INTO _meta VALUES (?,?)", (key, value))
+
+
+def build_index(
+    conn: sqlite3.Connection,
+    cache_dir: Path,
+    docs_path: str,
+    base_url: str,
+) -> None:
+    print("[mkdocs-docs] Indexing docs …", file=sys.stderr)
+
+    docs_dir = cache_dir / docs_path
+    if not docs_dir.exists():
+        docs_dir = cache_dir
+
+    nav_map = parse_nav(cache_dir, base_url)
+    nav_source = "mkdocs.yml" if nav_map else "file paths"
+    print(f"[mkdocs-docs] URL source: {nav_source}", file=sys.stderr)
+
+    conn.execute("DELETE FROM chunks")
+
+    rows = []
+    for md in sorted(docs_dir.rglob("*.md")):
+        try:
+            content = md.read_text(errors="ignore")
+        except OSError:
+            continue
+
+        rel = str(md.relative_to(docs_dir))
+        url = nav_map.get(rel) or _file_to_url(rel, base_url)
+        ptitle = page_title(content, md.stem.replace("-", " ").replace("_", " ").title())
+
+        for sec_title, body in chunk_markdown(content):
+            rows.append((rel, ptitle, sec_title, url, body))
+
+    conn.executemany("INSERT INTO chunks VALUES (?,?,?,?,?)", rows)
+    _meta_set(conn, "git_head", _git_head(cache_dir) or "unknown")
+    _meta_set(conn, "base_url", base_url)
+    conn.commit()
+    print(f"[mkdocs-docs] Indexed {len(rows)} chunks from {docs_dir}.", file=sys.stderr)
+
+
+def ensure_index(
+    conn: sqlite3.Connection,
+    cache_dir: Path,
+    docs_path: str,
+    base_url: str,
+    force: bool = False,
+) -> None:
+    current = _git_head(cache_dir) or "unknown"
+    if force or _meta_get(conn, "git_head") != current or _meta_get(conn, "base_url") != base_url:
+        build_index(conn, cache_dir, docs_path, base_url)
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+
+def _fts_query(raw: str) -> str:
+    """Build a safe FTS5 query: quoted phrases + individual terms."""
+    # Strip special FTS5 chars, keep words and spaces
+    clean = re.sub(r'[^\w\s]', ' ', raw)
+    terms = [t for t in clean.split() if len(t) > 1]
+    if not terms:
+        return '""'
+    # Try full phrase first via OR with individual terms
+    phrase = f'"{" ".join(terms)}"'
+    singles = " OR ".join(f'"{t}"' for t in terms)
+    return f"{phrase} OR {singles}"
 
 
 def search(
-    cache_dir: Path,
-    docs_path: str,
+    conn: sqlite3.Connection,
     query: str,
-    base_url: str,
     max_results: int = 5,
+    snippet_tokens: int = 60,
 ) -> list[dict]:
-    docs_dir = cache_dir / docs_path
-    if not docs_dir.exists():
-        docs_dir = cache_dir
+    fts_q = _fts_query(query)
 
-    terms = [t.lower() for t in re.findall(r"\w+", query) if len(t) > 2]
-    if not terms:
-        return []
+    rows = conn.execute(
+        """
+        SELECT path, title, section, url,
+               snippet(chunks, 4, '<b>', '</b>', '…', ?) AS excerpt,
+               rank
+        FROM   chunks
+        WHERE  chunks MATCH ?
+        ORDER  BY rank
+        LIMIT  ?
+        """,
+        (snippet_tokens, fts_q, max_results * 4),
+    ).fetchall()
 
-    # Score every markdown file
-    scored: list[tuple[int, Path]] = []
-    for md in docs_dir.rglob("*.md"):
-        try:
-            content = md.read_text(errors="ignore")
-        except OSError:
-            continue
-        lower = content.lower()
-        score = sum(lower.count(t) for t in terms)
-        if score > 0:
-            scored.append((score, md))
+    # Group by URL, keep best section + up to 2 additional excerpts
+    pages: dict[str, dict] = {}
+    order: list[str] = []
 
-    scored.sort(reverse=True)
+    for row in rows:
+        url = row["url"]
+        if url not in pages:
+            if len(pages) >= max_results:
+                continue
+            pages[url] = {
+                "title": row["title"],
+                "url": url,
+                "excerpts": [],
+            }
+            order.append(url)
+        entry = pages[url]
+        if len(entry["excerpts"]) < 3:
+            section = row["section"]
+            header = f"**{section}**\n" if section and section != row["title"] else ""
+            entry["excerpts"].append(header + row["excerpt"])
 
-    results: list[dict] = []
-    for _, md in scored[: max_results * 2]:
-        if len(results) >= max_results:
-            break
-        try:
-            content = md.read_text(errors="ignore")
-        except OSError:
-            continue
-
-        excerpts = _extract_sections(content, terms)
-        if not excerpts:
-            continue
-
-        # Page title: first H1 or prettified filename
-        title = md.stem.replace("-", " ").replace("_", " ").title()
-        for ln in content.splitlines()[:15]:
-            if ln.startswith("# "):
-                title = ln[2:].strip()
-                break
-
-        url = _path_to_url(md.relative_to(docs_dir), base_url)
-        results.append({"title": title, "url": url, "excerpts": excerpts})
-
-    return results
+    return [pages[u] for u in order]
 
 
-def list_sections(cache_dir: Path, docs_path: str) -> list[str]:
-    docs_dir = cache_dir / docs_path
-    if not docs_dir.exists():
-        docs_dir = cache_dir
-    return sorted(f.stem for f in docs_dir.glob("*.md"))
+def list_pages(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute(
+        "SELECT DISTINCT title, url FROM chunks ORDER BY title"
+    ).fetchall()
+    return [{"title": r["title"], "url": r["url"]} for r in rows]
 
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
+
 def print_text(results: list[dict]) -> None:
     if not results:
-        print("No relevant documentation found for this query.")
+        print("No relevant documentation found.")
         return
 
     for i, r in enumerate(results, 1):
@@ -215,43 +366,45 @@ def print_text(results: list[dict]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="MkDocs local RAG search",
+        description="MkDocs local RAG search — SQLite FTS5 + mkdocs.yml",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--repo-url", required=True, help="Git URL of the MkDocs repo")
-    p.add_argument("--repo-name", required=True, help="Short name for the cache directory")
-    p.add_argument("--base-url", required=True, help="Base URL of the published docs site")
-    p.add_argument("--docs-path", default="docs", help="Path inside the repo for .md files")
-    p.add_argument("--update-interval", type=int, default=24, help="Hours between git pull checks")
+    p.add_argument("--repo-url", required=True, help="Git clone URL")
+    p.add_argument("--repo-name", required=True, help="Cache directory name")
+    p.add_argument("--base-url", required=True, help="Published docs root URL")
+    p.add_argument("--docs-path", default="docs", help="Subdir inside repo with .md files")
+    p.add_argument("--update-interval", type=int, default=24, help="Hours between git pulls")
     p.add_argument("--query", default="", help="Search query")
     p.add_argument("--max-results", type=int, default=5)
-    p.add_argument("--json", action="store_true", help="Output JSON")
-    p.add_argument(
-        "--list-sections",
-        action="store_true",
-        help="List top-level doc sections instead of searching",
-    )
+    p.add_argument("--reindex", action="store_true", help="Force full index rebuild")
+    p.add_argument("--list-pages", action="store_true", help="List all indexed pages")
+    p.add_argument("--json", action="store_true", help="JSON output")
     args = p.parse_args()
 
     cache_dir = CACHE_BASE / args.repo_name
-    ensure_cache(args.repo_url, cache_dir, args.update_interval)
+    updated = ensure_cache(args.repo_url, cache_dir, args.update_interval)
 
-    if args.list_sections:
-        sections = list_sections(cache_dir, args.docs_path)
+    db_path = cache_dir / ".search.db"
+    conn = open_db(db_path)
+    ensure_index(conn, cache_dir, args.docs_path, args.base_url, force=args.reindex or updated)
+
+    if args.list_pages:
+        pages = list_pages(conn)
         if args.json:
-            print(json.dumps(sections))
+            print(json.dumps(pages, ensure_ascii=False))
         else:
-            print("Available documentation sections:")
-            for s in sections:
-                print(f"  - {s}")
+            print(f"Indexed pages ({len(pages)}):")
+            for pg in pages:
+                print(f"  {pg['title']:40s}  {pg['url']}")
         return
 
     if not args.query:
-        p.error("--query is required unless --list-sections is set")
+        p.error("--query is required unless --list-pages is used")
 
-    results = search(cache_dir, args.docs_path, args.query, args.base_url, args.max_results)
+    results = search(conn, args.query, args.max_results)
 
     if args.json:
         print(json.dumps(results, indent=2, ensure_ascii=False))
