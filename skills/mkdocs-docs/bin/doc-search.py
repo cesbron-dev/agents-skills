@@ -270,18 +270,46 @@ def ensure_index(
 
 
 # ---------------------------------------------------------------------------
+# Code block extraction
+# ---------------------------------------------------------------------------
+
+_CODE_BLOCK = re.compile(r"```(\w*)\n(.*?)```", re.DOTALL)
+# Config-related languages worth extracting
+_CONFIG_LANGS = {"yaml", "yml", "json", "toml", "hcl", "tf", "ini", "env", "properties", "xml", ""}
+
+
+def extract_code_blocks(text: str) -> list[dict]:
+    """Return all fenced code blocks as {lang, code} dicts."""
+    return [
+        {"lang": m.group(1).lower() or "text", "code": m.group(2).strip()}
+        for m in _CODE_BLOCK.finditer(text)
+        if m.group(2).strip()
+    ]
+
+
+def config_code_blocks(text: str) -> list[dict]:
+    """Return only code blocks whose language looks like a config format."""
+    return [b for b in extract_code_blocks(text) if b["lang"] in _CONFIG_LANGS]
+
+
+def _strip_code_blocks(text: str) -> str:
+    return _CODE_BLOCK.sub("", text).strip()
+
+
+# ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
 
+# Extra terms appended to queries in configure mode to surface config sections
+_CONFIG_BOOST = "configuration options parameters settings example"
+
 
 def _fts_query(raw: str) -> str:
-    """Build a safe FTS5 query: quoted phrases + individual terms."""
-    # Strip special FTS5 chars, keep words and spaces
-    clean = re.sub(r'[^\w\s]', ' ', raw)
+    """Build a safe FTS5 query: quoted phrase + individual terms as OR."""
+    clean = re.sub(r"[^\w\s]", " ", raw)
     terms = [t for t in clean.split() if len(t) > 1]
     if not terms:
         return '""'
-    # Try full phrase first via OR with individual terms
     phrase = f'"{" ".join(terms)}"'
     singles = " OR ".join(f'"{t}"' for t in terms)
     return f"{phrase} OR {singles}"
@@ -293,6 +321,7 @@ def search(
     max_results: int = 5,
     snippet_tokens: int = 60,
 ) -> list[dict]:
+    """Standard search: returns short BM25 snippets."""
     fts_q = _fts_query(query)
 
     rows = conn.execute(
@@ -308,7 +337,6 @@ def search(
         (snippet_tokens, fts_q, max_results * 4),
     ).fetchall()
 
-    # Group by URL, keep best section + up to 2 additional excerpts
     pages: dict[str, dict] = {}
     order: list[str] = []
 
@@ -317,17 +345,61 @@ def search(
         if url not in pages:
             if len(pages) >= max_results:
                 continue
-            pages[url] = {
-                "title": row["title"],
-                "url": url,
-                "excerpts": [],
-            }
+            pages[url] = {"title": row["title"], "url": url, "excerpts": []}
             order.append(url)
         entry = pages[url]
         if len(entry["excerpts"]) < 3:
-            section = row["section"]
-            header = f"**{section}**\n" if section and section != row["title"] else ""
+            sec = row["section"]
+            header = f"**{sec}**\n" if sec and sec != row["title"] else ""
             entry["excerpts"].append(header + row["excerpt"])
+
+    return [pages[u] for u in order]
+
+
+def search_configure(
+    conn: sqlite3.Connection,
+    query: str,
+    max_results: int = 5,
+    body_chars: int = 2000,
+) -> list[dict]:
+    """
+    Configure mode: augments the query with config terms, returns full section
+    bodies and extracts code blocks (YAML / HCL / JSON / TOML / …).
+    """
+    augmented = f"{query} {_CONFIG_BOOST}"
+    fts_q = _fts_query(augmented)
+
+    rows = conn.execute(
+        """
+        SELECT path, title, section, url, body, rank
+        FROM   chunks
+        WHERE  chunks MATCH ?
+        ORDER  BY rank
+        LIMIT  ?
+        """,
+        (fts_q, max_results * 4),
+    ).fetchall()
+
+    pages: dict[str, dict] = {}
+    order: list[str] = []
+
+    for row in rows:
+        url = row["url"]
+        if url not in pages:
+            if len(pages) >= max_results:
+                continue
+            pages[url] = {"title": row["title"], "url": url, "sections": []}
+            order.append(url)
+        entry = pages[url]
+        if len(entry["sections"]) < 3:
+            body = row["body"]
+            blocks = config_code_blocks(body)
+            description = _strip_code_blocks(body)[:body_chars]
+            entry["sections"].append({
+                "heading": row["section"],
+                "description": description,
+                "code_blocks": blocks,
+            })
 
     return [pages[u] for u in order]
 
@@ -362,6 +434,32 @@ def print_text(results: list[dict]) -> None:
         print(f"[{i}] [{r['title']}]({r['url']})")
 
 
+def print_configure(results: list[dict]) -> None:
+    if not results:
+        print("No configuration documentation found.")
+        return
+
+    for i, r in enumerate(results, 1):
+        print(f"### [{i}] {r['title']}")
+        print(f"Source: {r['url']}\n")
+        for sec in r["sections"]:
+            if sec["heading"]:
+                print(f"#### {sec['heading']}\n")
+            if sec["description"]:
+                print(sec["description"])
+                print()
+            for block in sec["code_blocks"]:
+                lang = block["lang"] or "text"
+                print(f"```{lang}")
+                print(block["code"])
+                print("```\n")
+        print("---\n")
+
+    print("**Sources**")
+    for i, r in enumerate(results, 1):
+        print(f"[{i}] [{r['title']}]({r['url']})")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -379,6 +477,15 @@ def main() -> None:
     p.add_argument("--update-interval", type=int, default=24, help="Hours between git pulls")
     p.add_argument("--query", default="", help="Search query")
     p.add_argument("--max-results", type=int, default=5)
+    p.add_argument(
+        "--mode",
+        choices=["search", "configure"],
+        default="search",
+        help=(
+            "search: short BM25 snippets for Q&A. "
+            "configure: full section bodies + code blocks for config generation."
+        ),
+    )
     p.add_argument("--reindex", action="store_true", help="Force full index rebuild")
     p.add_argument("--list-pages", action="store_true", help="List all indexed pages")
     p.add_argument("--json", action="store_true", help="JSON output")
@@ -404,12 +511,18 @@ def main() -> None:
     if not args.query:
         p.error("--query is required unless --list-pages is used")
 
-    results = search(conn, args.query, args.max_results)
-
-    if args.json:
-        print(json.dumps(results, indent=2, ensure_ascii=False))
+    if args.mode == "configure":
+        results = search_configure(conn, args.query, args.max_results)
+        if args.json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            print_configure(results)
     else:
-        print_text(results)
+        results = search(conn, args.query, args.max_results)
+        if args.json:
+            print(json.dumps(results, indent=2, ensure_ascii=False))
+        else:
+            print_text(results)
 
 
 if __name__ == "__main__":
