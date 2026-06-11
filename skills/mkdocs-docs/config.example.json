@@ -1,0 +1,7 @@
+{
+  "repo_url": "https://github.com/your-org/your-docs.git",
+  "base_url": "https://docs.your-project.com",
+  "repo_name": "your-docs",
+  "docs_path": "docs",
+  "update_interval_hours": 24
+}

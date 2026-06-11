@@ -1,0 +1,3 @@
+# pyyaml enables mkdocs.yml nav parsing for accurate URLs.
+# Without it the skill falls back to deriving URLs from file paths.
+pyyaml>=6.0
